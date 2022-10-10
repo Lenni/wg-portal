@@ -28,13 +28,17 @@ RUN curl -L https://git.prolicht.digital/pub/healthcheck/-/releases/v1.0.1/downl
     chmod +rx /build/hc; \
     echo "Building version: $ENV_BUILD_IDENTIFIER-$ENV_BUILD_VERSION"
 
+## Add the wait script to the image
+ADD https://github.com/ufoscout/docker-compose-wait/releases/download/2.9.0/wait wait
+RUN chmod +x wait
+
 # Build the Go app
 RUN go clean -modcache; go mod tidy; make build-docker
 
 ######-
 # Here starts the main image
 ######-
-FROM scratch
+FROM alpine:3
 
 # Setup timezone
 ENV TZ=Europe/Vienna
@@ -46,6 +50,7 @@ COPY --from=builder /etc/group /etc/group
 
 # Import healthcheck binary
 COPY --from=builder /build/hc /app/hc
+COPY --from=builder /build/wait /app/wait
 
 # Copy binaries
 COPY --from=builder /build/dist/wgportal /app/wgportal
@@ -54,6 +59,6 @@ COPY --from=builder /build/dist/wgportal /app/wgportal
 WORKDIR /app
 
 # Command to run the executable
-CMD [ "/app/wgportal" ]
+CMD /app/wait && /app/wgportal
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD [ "/app/hc", "http://localhost:11223/health" ]
