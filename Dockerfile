@@ -62,6 +62,8 @@ COPY --from=builder /build/dist/wg-portal /app/wg-portal
 # Set the Current Working Directory inside the container
 WORKDIR /app
 
+EXPOSE 8123
+
 # Command to run the executable
 CMD /app/wait && /app/wgportal
 
