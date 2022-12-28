@@ -4,20 +4,42 @@ import (
 	"strings"
 	"time"
 
-	"github.com/h44z/wg-portal/internal/wireguard"
-
+	gldap "github.com/go-ldap/ldap/v3"
 	"github.com/h44z/wg-portal/internal/ldap"
 	"github.com/h44z/wg-portal/internal/users"
+	"github.com/h44z/wg-portal/internal/wireguard"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
-
-	gldap "github.com/go-ldap/ldap/v3"
 )
 
 func (s *Server) SyncLdapWithUserDatabase() {
 	logrus.Info("starting ldap user synchronization...")
+
 	running := true
 	for running {
+		// Main work here
+		logrus.Trace("syncing ldap users to database...")
+		ldapUsers, err := ldap.FindAllObjects(&s.config.LDAP, ldap.Users)
+		if err != nil {
+			logrus.Errorf("failed to fetch users from ldap: %v", err)
+			continue
+		}
+		ldapGroups, err := ldap.FindAllObjects(&s.config.LDAP, ldap.Groups)
+		if err != nil {
+			logrus.Errorf("failed to fetch groups from ldap: %v", err)
+			continue
+		}
+
+		logrus.Tracef("found %d users and %d groups in ldap", len(ldapUsers), len(ldapGroups))
+
+		// Update existing LDAP users
+		s.updateLdapUsers(ldapUsers, ldapGroups)
+
+		// Disable missing LDAP users
+		s.disableMissingLdapUsers(ldapUsers)
+
+		logrus.Trace("synchronized ldap users to database")
+
 		// Select blocks until one of the cases happens
 		select {
 		case <-time.After(1 * time.Minute):
@@ -27,42 +49,71 @@ func (s *Server) SyncLdapWithUserDatabase() {
 			running = false
 			continue
 		}
-
-		// Main work here
-		logrus.Trace("syncing ldap users to database...")
-		ldapUsers, err := ldap.FindAllUsers(&s.config.LDAP)
-		if err != nil {
-			logrus.Errorf("failed to fetch users from ldap: %v", err)
-			continue
-		}
-		logrus.Tracef("found %d users in ldap", len(ldapUsers))
-
-		// Update existing LDAP users
-		s.updateLdapUsers(ldapUsers)
-
-		// Disable missing LDAP users
-		s.disableMissingLdapUsers(ldapUsers)
 	}
 	logrus.Info("ldap user synchronization stopped")
 }
 
-func (s Server) userIsInAdminGroup(ldapData *ldap.RawLdapData) bool {
+func (s Server) userIsInAdminGroup(userData *ldap.RawLdapData, groupTreeData []ldap.RawLdapData) bool {
 	if s.config.LDAP.EveryoneAdmin {
 		return true
 	}
 	if s.config.LDAP.AdminLdapGroup_ == nil {
 		return false
 	}
-	for _, group := range ldapData.RawAttributes[s.config.LDAP.GroupMemberAttribute] {
-		var dn, _ = gldap.ParseDN(string(group))
-		if s.config.LDAP.AdminLdapGroup_.Equal(dn) {
+
+	for _, userGroup := range userData.RawAttributes[s.config.LDAP.GroupMemberAttribute] {
+		var userGroupDn, _ = gldap.ParseDN(string(userGroup))
+		if s.dnIsAdminGroup(userGroupDn, groupTreeData) {
 			return true
 		}
 	}
 	return false
 }
 
-func (s Server) userChangedInLdap(user *users.User, ldapData *ldap.RawLdapData) bool {
+// dnIsAdminGroup checks if the given DN is equal to the admin group, or if it is included in a groupTree that has the
+// admin group as parent/root.
+//
+// WGPortal-Admin          (L0)
+//
+//	\_ IT-Admin            (L1)
+//	  |_ Alice             (L2)
+//	  |_ Bob               (L2)
+//	  \_ Eve               (L2)
+//	\_ External-Company    (L1)
+//	  |_ External-Admin    (L2)
+//	    |_ Sam             (L3)
+//	    \_ Steve           (L3)
+//
+// All DNs in the example above are member of the admin group.
+func (s Server) dnIsAdminGroup(dn *gldap.DN, groupTreeData []ldap.RawLdapData) bool {
+	if s.config.LDAP.AdminLdapGroup_ == nil {
+		return false
+	}
+
+	if s.config.LDAP.AdminLdapGroup_.Equal(dn) {
+		return true
+	}
+
+	// Recursively check the whole group tree
+	for _, group := range groupTreeData {
+		var groupDn, _ = gldap.ParseDN(group.DN)
+		if !dn.Equal(groupDn) {
+			continue
+		}
+
+		for _, parentGroupDn := range group.RawAttributes[s.config.LDAP.GroupMemberAttribute] {
+			var parentDn, _ = gldap.ParseDN(string(parentGroupDn))
+			if s.dnIsAdminGroup(parentDn, groupTreeData) {
+				return true
+			}
+		}
+
+		break
+	}
+	return false
+}
+
+func (s Server) userChangedInLdap(user *users.User, ldapData *ldap.RawLdapData, ldapGroupData []ldap.RawLdapData) bool {
 	if user.Firstname != ldapData.Attributes[s.config.LDAP.FirstNameAttribute] {
 		return true
 	}
@@ -83,7 +134,7 @@ func (s Server) userChangedInLdap(user *users.User, ldapData *ldap.RawLdapData) 
 		return true
 	}
 
-	if user.IsAdmin != s.userIsInAdminGroup(ldapData) {
+	if user.IsAdmin != s.userIsInAdminGroup(ldapData, ldapGroupData) {
 		return true
 	}
 
@@ -126,7 +177,7 @@ func (s *Server) disableMissingLdapUsers(ldapUsers []ldap.RawLdapData) {
 	}
 }
 
-func (s *Server) updateLdapUsers(ldapUsers []ldap.RawLdapData) {
+func (s *Server) updateLdapUsers(ldapUsers []ldap.RawLdapData, ldapGroups []ldap.RawLdapData) {
 	for i := range ldapUsers {
 		if ldapUsers[i].Attributes[s.config.LDAP.EmailAttribute] == "" {
 			logrus.Tracef("skipping sync of %s, empty email attribute", ldapUsers[i].DN)
@@ -152,13 +203,13 @@ func (s *Server) updateLdapUsers(ldapUsers []ldap.RawLdapData) {
 		}
 
 		// Sync attributes from ldap
-		if s.userChangedInLdap(user, &ldapUsers[i]) {
+		if s.userChangedInLdap(user, &ldapUsers[i], ldapGroups) {
 			logrus.Debugf("updating ldap user %s", user.Email)
 			user.Firstname = ldapUsers[i].Attributes[s.config.LDAP.FirstNameAttribute]
 			user.Lastname = ldapUsers[i].Attributes[s.config.LDAP.LastNameAttribute]
 			user.Email = ldapUsers[i].Attributes[s.config.LDAP.EmailAttribute]
 			user.Phone = ldapUsers[i].Attributes[s.config.LDAP.PhoneAttribute]
-			user.IsAdmin = s.userIsInAdminGroup(&ldapUsers[i])
+			user.IsAdmin = s.userIsInAdminGroup(&ldapUsers[i], ldapGroups)
 			user.Source = users.UserSourceLdap
 			user.DeletedAt = gorm.DeletedAt{} // Not deleted
 
